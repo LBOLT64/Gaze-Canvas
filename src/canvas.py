@@ -1,9 +1,13 @@
 """
 Gaze Canvas — drawable surface with dwell-based colour cycling.
+
+Robustness: ``draw_at()`` clamps coordinates to the surface bounds so
+out-of-range gaze values never cause an error.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from datetime import datetime
@@ -19,18 +23,22 @@ from src.config import (
     PALETTE,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class Canvas:
     """RGBA drawing surface that the user paints on with their gaze."""
 
     def __init__(self, width: int, height: int) -> None:
+        self._width = width
+        self._height = height
         self._surface = pygame.Surface((width, height), pygame.SRCALPHA)
         self.colour_index: int = 0
         self.brush: int = BRUSH_DEFAULT
         self.erase: bool = False
 
         # Dwell tracking
-        self._dwell_start: int | None = None
+        self._dwell_accum: float = 0.0
         self._last_pos: tuple[float, float] | None = None
 
     # ------------------------------------------------------------------ #
@@ -43,9 +51,12 @@ class Canvas:
 
         Returns *True* if a dwell event fired (colour was cycled).
         """
-        ix, iy = int(x), int(y)
+        # Clamp to surface bounds
+        ix = max(0, min(int(x), self._width - 1))
+        iy = max(0, min(int(y), self._height - 1))
 
         if self.erase:
+            # Draw with fully transparent black to "erase"
             pygame.draw.circle(
                 self._surface, (0, 0, 0, 0), (ix, iy), self.brush * 2
             )
@@ -59,15 +70,15 @@ class Canvas:
         if self._last_pos is not None:
             dist = math.hypot(x - self._last_pos[0], y - self._last_pos[1])
             if dist < DWELL_RADIUS_PX:
-                if self._dwell_start is None:
-                    self._dwell_start = 0
-                self._dwell_start += dt_ms
-                if self._dwell_start >= DWELL_TIME_MS:
+                self._dwell_accum += dt_ms
+                if self._dwell_accum >= DWELL_TIME_MS:
                     self.cycle_colour()
-                    self._dwell_start = None
+                    self._dwell_accum = 0.0
                     dwelled = True
+                    logger.debug("Dwell colour cycle → index %d", self.colour_index)
             else:
-                self._dwell_start = None
+                self._dwell_accum = 0.0
+
         self._last_pos = (x, y)
         return dwelled
 
@@ -90,6 +101,9 @@ class Canvas:
 
     def clear(self) -> None:
         self._surface.fill((0, 0, 0, 0))
+        self._dwell_accum = 0.0
+        self._last_pos = None
+        logger.info("Canvas cleared")
 
     def save(self) -> str:
         """Save the canvas to a timestamped PNG and return the path."""
@@ -97,6 +111,7 @@ class Canvas:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join("saves", f"gaze_canvas_{ts}.png")
         pygame.image.save(self._surface, path)
+        logger.info("Canvas saved → %s", path)
         return path
 
     def get_surface(self) -> pygame.Surface:
