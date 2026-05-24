@@ -13,15 +13,16 @@ import logging
 SCREEN_W, SCREEN_H = 1280, 800
 
 # ---------------------------------------------------------------------------
-# Gaze smoothing
+# Camera
 # ---------------------------------------------------------------------------
-SMOOTHING_WINDOW = 10
+CAM_WIDTH, CAM_HEIGHT = 1280, 720
 
 # ---------------------------------------------------------------------------
-# Dwell detection
+# Gaze smoothing  (One Euro Filter parameters)
 # ---------------------------------------------------------------------------
-DWELL_RADIUS_PX = 35
-DWELL_TIME_MS = 1500
+OEF_MIN_CUTOFF = 1.7   # lower = smoother, higher = more responsive
+OEF_BETA = 0.8         # higher = faster reaction to speed changes
+OEF_D_CUTOFF = 1.0     # derivative low-pass cutoff
 
 # ---------------------------------------------------------------------------
 # Brush
@@ -33,6 +34,18 @@ BRUSH_DEFAULT = 14
 # Calibration
 # ---------------------------------------------------------------------------
 CAL_POINTS = 9
+CAL_SAMPLES_PER_POINT = 25       # frames to collect per target
+CAL_OUTLIER_SIGMA = 2.0          # reject samples beyond this many σ
+
+# ---------------------------------------------------------------------------
+# Blink detection  (EAR-based)
+# ---------------------------------------------------------------------------
+BLINK_EAR_DEFAULT_THRESHOLD = 0.20
+BLINK_CLOSED_RATIO = 0.60       # threshold = baseline_ear × ratio
+BLINK_OPEN_RATIO = 0.75         # hysteresis open threshold
+BLINK_SHORT_MAX_MS = 250        # ignore blinks shorter than this
+BLINK_LONG_MIN_MS = 800         # intentional blink minimum
+BLINK_COOLDOWN_MS = 1000        # cooldown after colour change
 
 # ---------------------------------------------------------------------------
 # Colour palette  (8 curated colours)

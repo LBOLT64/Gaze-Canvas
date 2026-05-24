@@ -1,8 +1,14 @@
 """
-Gaze Canvas — 9-point calibration with Ridge regression.
+Gaze Canvas — 9-point calibration with multi-sample collection and
+PolynomialFeatures + Ridge regression.
 
-Safety: ``transform()`` always returns valid screen coordinates even if
-the model is not yet fitted (returns screen-centre as fallback).
+Improvements over v1
+--------------------
+* Collects 25 samples per calibration point (not 1).
+* Rejects outlier samples beyond 2σ.
+* Uses degree-2 polynomial features for non-linear screen mapping.
+* Collects EAR samples during calibration for blink-threshold tuning.
+* ``transform()`` always returns valid, clamped screen coordinates.
 """
 
 from __future__ import annotations
@@ -11,12 +17,16 @@ import logging
 
 import numpy as np
 from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import PolynomialFeatures
+
+from src.config import CAL_OUTLIER_SIGMA, CAL_SAMPLES_PER_POINT
 
 logger = logging.getLogger(__name__)
 
 
 class CalibrationManager:
-    """Collects gaze→screen samples and fits a Ridge regressor."""
+    """Collects gaze→screen samples and fits a polynomial Ridge model."""
 
     def __init__(self, screen_w: int, screen_h: int) -> None:
         self._sw = screen_w
@@ -34,10 +44,15 @@ class CalibrationManager:
         self._X_train: list[list[float]] = []
         self._y_train: list[list[int]] = []
         self._index: int = 0
-        self.model: Ridge | None = None
+        self.model: Pipeline | None = None
+
+        # --- Multi-sample state ---
+        self._collecting: bool = False
+        self._current_samples: list[list[float]] = []
+        self._ear_samples: list[float] = []     # for blink-detector calibration
 
     # ------------------------------------------------------------------ #
-    # Public API
+    # Public queries
     # ------------------------------------------------------------------ #
 
     def is_calibrated(self) -> bool:
@@ -45,8 +60,20 @@ class CalibrationManager:
 
     @property
     def current_index(self) -> int:
-        """How many calibration points have been recorded so far."""
+        """How many calibration points have been fully recorded."""
         return self._index
+
+    @property
+    def is_collecting(self) -> bool:
+        """True while we are auto-collecting samples for a point."""
+        return self._collecting
+
+    @property
+    def collection_progress(self) -> float:
+        """0.0 → 1.0 progress of the current sample collection."""
+        if not self._collecting:
+            return 0.0
+        return len(self._current_samples) / CAL_SAMPLES_PER_POINT
 
     def current_target(self) -> tuple[int, int]:
         """Screen position of the calibration dot the user should look at."""
@@ -54,43 +81,107 @@ class CalibrationManager:
             return self._targets[-1]
         return self._targets[self._index]
 
-    def record_sample(self, raw_x: float, raw_y: float) -> bool:
-        """
-        Record one gaze sample for the current target.
+    @property
+    def ear_samples(self) -> list[float]:
+        """EAR values collected during calibration (for blink-detector)."""
+        return self._ear_samples
 
-        Returns *True* when all 9 points have been collected and the
-        model is fitted.
-        """
+    # ------------------------------------------------------------------ #
+    # Sample collection
+    # ------------------------------------------------------------------ #
+
+    def start_collecting(self) -> None:
+        """Call when the user presses SPACE — begins auto-collection."""
         if self._index >= len(self._targets):
-            return True                       # already calibrated
+            return
+        self._collecting = True
+        self._current_samples.clear()
+        logger.info(
+            "Collecting samples for cal point %d/%d …",
+            self._index + 1, len(self._targets),
+        )
 
-        tx, ty = self._targets[self._index]
-        self._X_train.append([raw_x, raw_y])
-        self._y_train.append([tx, ty])
-        self._index += 1
+    def feed_sample(self, rel_x: float, rel_y: float,
+                    avg_ear: float | None = None) -> bool:
+        """Feed one gaze frame during collection.
 
-        logger.info("Calibration sample %d/%d recorded  (raw %.4f, %.4f) → (%d, %d)",
-                     self._index, len(self._targets), raw_x, raw_y, tx, ty)
+        Returns *True* when this calibration point is done.
+        """
+        if not self._collecting:
+            return False
 
-        if self._index >= len(self._targets):
-            self.model = Ridge(alpha=1.0)
-            self.model.fit(
-                np.array(self._X_train),
-                np.array(self._y_train),
-            )
-            logger.info("Calibration complete — Ridge model fitted")
+        self._current_samples.append([rel_x, rel_y])
+        if avg_ear is not None and avg_ear > 0.05:
+            self._ear_samples.append(avg_ear)
+
+        if len(self._current_samples) >= CAL_SAMPLES_PER_POINT:
+            self._finalize_point()
             return True
         return False
 
-    def transform(self, raw_x: float, raw_y: float) -> tuple[float, float]:
-        """Map normalised gaze to screen coords via the fitted model.
+    # ------------------------------------------------------------------ #
+    # Internals
+    # ------------------------------------------------------------------ #
 
-        Returns screen-centre if the model is not yet available (safety).
+    def _finalize_point(self) -> None:
+        """Average collected samples, reject outliers, store the result."""
+        samples = np.array(self._current_samples)
+        mean = samples.mean(axis=0)
+        std = samples.std(axis=0)
+
+        # Reject outliers — keep only samples within σ threshold
+        if std.max() > 1e-8:
+            dists = np.abs(samples - mean)
+            mask = np.all(dists < CAL_OUTLIER_SIGMA * (std + 1e-9), axis=1)
+            clean = samples[mask]
+            if len(clean) < 5:
+                clean = samples        # fallback if too many rejected
+        else:
+            clean = samples
+
+        final = clean.mean(axis=0).tolist()
+        tx, ty = self._targets[self._index]
+        self._X_train.append(final)
+        self._y_train.append([tx, ty])
+        self._index += 1
+        self._collecting = False
+
+        logger.info(
+            "Cal point %d/%d done — kept %d/%d samples — "
+            "mean (%.4f, %.4f) → (%d, %d)",
+            self._index, len(self._targets),
+            len(clean), len(self._current_samples),
+            final[0], final[1], tx, ty,
+        )
+
+        if self._index >= len(self._targets):
+            self._fit_model()
+
+    def _fit_model(self) -> None:
+        """Fit PolynomialFeatures(degree=2) + Ridge on collected data."""
+        self.model = Pipeline([
+            ("poly", PolynomialFeatures(degree=2, include_bias=True)),
+            ("ridge", Ridge(alpha=1.0)),
+        ])
+        self.model.fit(
+            np.array(self._X_train),
+            np.array(self._y_train),
+        )
+        logger.info("Calibration complete — polynomial Ridge model fitted")
+
+    # ------------------------------------------------------------------ #
+    # Transform
+    # ------------------------------------------------------------------ #
+
+    def transform(self, rel_x: float, rel_y: float) -> tuple[float, float]:
+        """Map relative gaze to screen coords via the fitted model.
+
+        Returns screen-centre if the model is not yet available.
         """
         if self.model is None:
             return self._sw / 2.0, self._sh / 2.0
         try:
-            pred = self.model.predict(np.array([[raw_x, raw_y]]))[0]
+            pred = self.model.predict(np.array([[rel_x, rel_y]]))[0]
             sx = float(np.clip(pred[0], 0, self._sw))
             sy = float(np.clip(pred[1], 0, self._sh))
             return sx, sy
@@ -98,10 +189,17 @@ class CalibrationManager:
             logger.debug("calibration.transform() failed", exc_info=True)
             return self._sw / 2.0, self._sh / 2.0
 
+    # ------------------------------------------------------------------ #
+    # Reset
+    # ------------------------------------------------------------------ #
+
     def reset(self) -> None:
         """Clear all training data and the fitted model."""
         self._X_train.clear()
         self._y_train.clear()
         self._index = 0
         self.model = None
+        self._collecting = False
+        self._current_samples.clear()
+        self._ear_samples.clear()
         logger.info("Calibration reset")

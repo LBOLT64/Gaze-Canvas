@@ -1,22 +1,25 @@
 """
 Gaze Canvas — threaded webcam capture with a bounded frame queue.
 
-Robustness guarantees
----------------------
-* The reader thread is a daemon so it dies if the main process exits.
-* ``stop()`` is safe to call multiple times.
-* If the webcam disconnects mid-run, ``get_frame()`` simply returns None
-  and ``is_open()`` becomes False — no crash.
+Improvements over v1
+--------------------
+* Forces 1280×720 resolution for consistent landmark quality.
+* Uses DirectShow backend on Windows for lower latency.
+* Minimises internal OpenCV buffer to 1 frame.
+* Thread-safe shutdown via lock + event.
 """
 
 from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 
 import cv2
 import numpy as np
+
+from src.config import CAM_WIDTH, CAM_HEIGHT
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ class CameraCapture:
         self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=2)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()          # guards _cap access
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -41,16 +44,27 @@ class CameraCapture:
 
         Returns True if the webcam opened successfully.
         """
-        self._cap = cv2.VideoCapture(self._device_id)
+        # Use DirectShow on Windows for lower latency
+        if sys.platform == "win32":
+            self._cap = cv2.VideoCapture(self._device_id, cv2.CAP_DSHOW)
+        else:
+            self._cap = cv2.VideoCapture(self._device_id)
+
         if not self._cap.isOpened():
             logger.error("Could not open webcam (device %s)", self._device_id)
             return False
 
+        # Force resolution and minimise internal buffer
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        actual_w = self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
         logger.info(
             "Webcam opened — %.0fx%.0f @ %.0f fps",
-            self._cap.get(cv2.CAP_PROP_FRAME_WIDTH),
-            self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
-            self._cap.get(cv2.CAP_PROP_FPS),
+            actual_w, actual_h, actual_fps,
         )
 
         self._stop_event.clear()
@@ -66,8 +80,7 @@ class CameraCapture:
             return None
 
     def stop(self) -> None:
-        """Signal the thread to stop and release the camera.  Safe to call
-        repeatedly or from any thread."""
+        """Signal the thread to stop and release the camera."""
         self._stop_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
